@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -11,13 +12,14 @@ import importer  # noqa: E402
 
 
 class Track:  # class name matters: Importer derives the search type from it
-    def __init__(self, id_, artist, title):
+    def __init__(self, id_, artist, title, duration_ms=None, isrc=None):
         self.id, self.title, self.artists = id_, title, [SimpleNamespace(name=artist)]
+        self.duration_ms, self.isrc = duration_ms, isrc
 
 
 class FakeSpotify:
     def __init__(self, catalog, liked=(), playlists=None):
-        self.catalog = catalog  # search query -> spotify id
+        self.catalog = catalog  # search query -> spotify id or list of result dicts
         self.liked = set(liked)
         self.playlists = playlists or {}  # name -> list of track ids
         self.searches = 0
@@ -29,7 +31,8 @@ class FakeSpotify:
     def search(self, query, type):
         self.searches += 1
         found = self.catalog.get(query)
-        return {f'{type}s': {'items': [{'id': found}] if found else []}}
+        items = found if isinstance(found, list) else [{'id': found}] if found else []
+        return {f'{type}s': {'items': items}}
 
     def current_user_saved_tracks_contains(self, ids):
         return [i in self.liked for i in ids]
@@ -44,8 +47,8 @@ class FakeSpotify:
     def playlist_items(self, playlist_id, additional_types):
         return {'items': [{'item': {'id': i}} for i in self.playlists[playlist_id]], 'next': None}
 
-    def current_user_playlist_create(self, name):
-        self.created.append(name)
+    def current_user_playlist_create(self, name, public=True):
+        self.created.append((name, public))
         self.playlists[name] = []
         return {'id': name}
 
@@ -98,7 +101,7 @@ class ImporterTest(unittest.TestCase):
         spotify = FakeSpotify(CATALOG, playlists={'Rock': ['sa']})
         imp = make(spotify, FakeYandex(playlists=[('Rock', [A, B]), ('Pop', [C])]), ignore=('likes', 'albums', 'artists'))
         imp.import_all()
-        self.assertEqual(spotify.created, ['Pop'])
+        self.assertEqual(spotify.created, [('Pop', False)])
         self.assertEqual(spotify.playlists, {'Rock': ['sa', 'sb'], 'Pop': ['sc']})
         self.assertEqual(imp.stats['Rock']['duplicates'], 1)
 
@@ -115,6 +118,39 @@ class ImporterTest(unittest.TestCase):
             self.assertEqual(spotify.searches, 1)  # only the miss is searched again
             with open(report, encoding='UTF-8') as f:
                 self.assertIn('- X - missing', f.read())
+
+    def test_isrc_is_searched_first(self):
+        spotify = FakeSpotify({'isrc:RU1': 'exact', 'A a': 'fuzzy'})
+        make(spotify, FakeYandex(likes=[Track(1, 'A', 'a', isrc='RU1')])).import_all()
+        self.assertEqual(spotify.liked, {'exact'})
+
+    def test_best_match_prefers_same_artist_then_close_duration(self):
+        results = [
+            {'id': 'cover', 'artists': [{'name': 'Someone'}], 'duration_ms': 200000},
+            {'id': 'live', 'artists': [{'name': 'Kino'}], 'duration_ms': 260000},
+            {'id': 'studio', 'artists': [{'name': 'KINO'}], 'duration_ms': 201500},
+        ]
+        self.assertEqual(importer.best_match(Track(1, 'Kino', 'x', duration_ms=200000), results)['id'], 'studio')
+        # without a duration Spotify's ranking decides among the same artist
+        self.assertEqual(importer.best_match(Track(1, 'Kino', 'x'), results)['id'], 'live')
+        # nothing matches: keep Spotify's first result
+        self.assertEqual(importer.best_match(Track(1, 'Nobody', 'x'), results)['id'], 'cover')
+
+    def test_not_found_file_can_be_imported_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            not_found = os.path.join(tmp, 'not-found.json')
+            missing = Track(9, 'X', 'missing')
+            imp = make(FakeSpotify(CATALOG), FakeYandex(likes=[A, missing], playlists=[('P', [missing])]),
+                       ignore=('albums', 'artists'))
+            imp.import_all()
+            imp.write_not_found(not_found)
+            with open(not_found, encoding='UTF-8') as f:
+                self.assertEqual(json.load(f), [{'artist': 'X', 'track': 'missing'}])
+
+            spotify = FakeSpotify({'X missing': 'sx'})
+            make(spotify, None, ignore=()).import_from_json(not_found)
+            self.assertEqual(spotify.playlists, {'Imported from JSON': ['sx']})
+            self.assertEqual(spotify.created, [('Imported from JSON', False)])
 
     def test_refresh_token_auth_is_non_interactive(self):
         args = Namespace(id='id', secret='secret', spotify=None, refresh_token='rt')

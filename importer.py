@@ -16,8 +16,9 @@ from yandex_music import Client, Artist
 REDIRECT_URI = 'https://open.spotify.com'
 MAX_REQUEST_RETRIES = 5
 # read scopes are needed for duplicate checks (library/contains, own playlists)
-SCOPE = ('playlist-modify-public,playlist-read-private,user-library-modify,user-library-read,'
-         'user-follow-modify,user-follow-read,ugc-image-upload')
+SCOPE = ('playlist-modify-public,playlist-modify-private,playlist-read-private,user-library-modify,'
+         'user-library-read,user-follow-modify,user-follow-read,ugc-image-upload')
+DURATION_TOLERANCE_MS = 3000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +67,32 @@ def handle_spotify_exception(func):
     return wrapper
 
 
+def best_match(item, found_items):
+    """Prefer results by the same artist, then with a close duration, then Spotify's own ranking."""
+    if isinstance(item, (str, Artist)):
+        return found_items[0]
+
+    names = {artist.name.casefold() for artist in item.artists}
+    duration = getattr(item, 'duration_ms', None)
+
+    def key(found):
+        same_artist = any(artist['name'].casefold() in names for artist in found.get('artists', []))
+        close = duration is not None and found.get('duration_ms') is not None \
+            and abs(found['duration_ms'] - duration) <= DURATION_TOLERANCE_MS
+        return not same_artist, not close
+
+    return min(found_items, key=key)  # min() keeps the first of equal results
+
+
+def as_json_track(item):
+    """Item in the --json-path format, or None for albums and artists."""
+    if isinstance(item, dict):
+        return item
+    if type(item).__name__ == 'Track':
+        return {'artist': ', '.join(artist.name for artist in item.artists), 'track': item.title}
+    return None
+
+
 class NotFoundException(SpotifyException):
     def __init__(self, item_name):
         self.item_name = item_name
@@ -73,11 +100,12 @@ class NotFoundException(SpotifyException):
 
 class Importer:
     def __init__(self, spotify_client, yandex_client: Client, ignore_list, strict_search, chunk_size,
-                 dry_run=False, cache_path=None):
+                 dry_run=False, cache_path=None, public=False):
         self.spotify_client = spotify_client
         self.yandex_client = yandex_client
         self.chunk_size = chunk_size
         self.dry_run = dry_run
+        self.public = public
 
         self._importing_items = {
             'likes': self.import_likes,
@@ -98,6 +126,7 @@ class Importer:
             logger.info('Dry run: nothing will be changed in Spotify')
 
         self.not_imported = {}
+        self.not_found_tracks = []
         self.stats = {}
 
         # Yandex item -> Spotify ID, so reruns don't search the same items again
@@ -114,7 +143,9 @@ class Importer:
                 json.dump(self.cache, file, ensure_ascii=False)
 
     def _import_item(self, item):
-        # if the item is a string, it is a query from the JSON file
+        # if the item is a dict or a string, it is a query from the JSON file
+        if isinstance(item, dict):
+            item = f'{item["artist"]} {item["track"]}'
         if isinstance(item, str):
             query = item
             item_name = item
@@ -140,8 +171,16 @@ class Importer:
             logger.info(f'Importing {type_}: {item_name}... (cached)')
             return self.cache[cache_key]
 
-        found_items = handle_spotify_exception(self.spotify_client.search)(query, type=type_)[f'{type_}s']['items']
         logger.info(f'Importing {type_}: {item_name}...')
+        found_items = []
+
+        # ISRC identifies the exact recording, so try it before the text search
+        isrc = getattr(item, 'isrc', None) if type_ == 'track' else None
+        if isrc:
+            found_items = handle_spotify_exception(self.spotify_client.search)(f'isrc:{isrc}', type='track')['tracks']['items']
+
+        if not found_items:
+            found_items = handle_spotify_exception(self.spotify_client.search)(query, type=type_)[f'{type_}s']['items']
 
         if not self._strict_search and not isinstance(item, Artist) and not len(found_items) and len(artists) > 1:
             query = f'{artists[0].name} {item.title}'
@@ -152,8 +191,9 @@ class Importer:
         if not len(found_items):
             raise NotFoundException(item_name)
 
-        self.cache[cache_key] = found_items[0]['id']
-        return found_items[0]['id']
+        spotify_id = best_match(item, found_items)['id']
+        self.cache[cache_key] = spotify_id
+        return spotify_id
 
     def _contains(self, check_method, ids):
         """Return the subset of ids that already exist (GET /me/library/contains, max 40 per request)."""
@@ -177,11 +217,12 @@ class Importer:
                 spotify_items.append(spotify_id)
                 logger.info('OK')
 
-            except NotFoundException as exception:
-                not_imported_section.append(exception.item_name)
-                logger.warning('NO')
-            except SpotifyException:
-                not_imported_section.append(item if isinstance(item, str) else getattr(item, 'title', None) or item.name)
+            except SpotifyException as exception:  # NotFoundException included
+                json_track = as_json_track(item)
+                not_imported_section.append(getattr(exception, 'item_name', None)
+                                            or (f'{json_track["artist"]} - {json_track["track"]}' if json_track else getattr(item, 'name', str(item))))
+                if json_track:
+                    self.not_found_tracks.append(json_track)
                 logger.warning('NO')
 
         # different Yandex tracks often resolve to the same Spotify track
@@ -253,7 +294,7 @@ class Importer:
             else:
                 existing_tracks = set()
                 if not self.dry_run:
-                    spotify_playlist_id = handle_spotify_exception(self.spotify_client.current_user_playlist_create)(playlist.title)['id']
+                    spotify_playlist_id = handle_spotify_exception(self.spotify_client.current_user_playlist_create)(playlist.title, public=self.public)['id']
                     own_playlists[playlist.title] = spotify_playlist_id
 
                     if playlist.cover.type == 'pic':
@@ -337,6 +378,12 @@ class Importer:
         with open(path, 'w', encoding='UTF-8') as file:
             file.write('\n'.join(lines) + '\n')
 
+    def write_not_found(self, path):
+        """Not found tracks in the --json-path format: fix the names and import them again."""
+        unique = {(track['artist'], track['track']): track for track in self.not_found_tracks}
+        with open(path, 'w', encoding='UTF-8') as file:
+            json.dump(list(unique.values()), file, ensure_ascii=False, indent=2)
+
     def import_from_json(self, file_path):
         with open(file_path, 'r', encoding='UTF-8') as file:
             tracks = json.load(file)
@@ -345,7 +392,7 @@ class Importer:
         playlist_id = self._own_playlists().get(playlist_name)
         existing = self._playlist_track_ids(playlist_id) if playlist_id else set()
         if not playlist_id and not self.dry_run:
-            playlist_id = handle_spotify_exception(self.spotify_client.current_user_playlist_create)(playlist_name)['id']
+            playlist_id = handle_spotify_exception(self.spotify_client.current_user_playlist_create)(playlist_name, public=self.public)['id']
 
         def save_tracks_callback(importer, chunk):
             logger.info(f'Saving {len(chunk)} tracks...')
@@ -354,8 +401,7 @@ class Importer:
 
         try:
             # reversed so that _add_items_to_spotify's reverse() keeps the file order
-            self._add_items_to_spotify([f'{track["artist"]} {track["track"]}' for track in reversed(tracks)],
-                                       playlist_name, save_tracks_callback, existing.intersection)
+            self._add_items_to_spotify(list(reversed(tracks)), playlist_name, save_tracks_callback, existing.intersection)
         finally:
             self.save_cache()
 
@@ -421,6 +467,8 @@ if __name__ == '__main__':
     parser.add_argument('-n', '--dry-run', action='store_true', help='Only search and report, change nothing in Spotify')
     parser.add_argument('--cache', help='JSON file to keep Yandex -> Spotify matches between runs')
     parser.add_argument('--report', help='Write a Markdown report to this file')
+    parser.add_argument('--not-found', help='Write not found tracks to this file in the --json-path format')
+    parser.add_argument('--public', action='store_true', help='Create public playlists (private by default)')
 
     arguments = parser.parse_args()
 
@@ -443,12 +491,20 @@ if __name__ == '__main__':
 
         yandex_client_ = None
 
-        if arguments.token:
+        if arguments.token and not arguments.json_path:
             yandex_client_ = Client(arguments.token)
             yandex_client_.init()
 
         importer_instance = Importer(spotify_client_, yandex_client_, arguments.ignore, arguments.strict_artists_search,
-                                     arguments.chunk, arguments.dry_run, arguments.cache)
+                                     arguments.chunk, arguments.dry_run, arguments.cache, arguments.public)
+
+        # a refresh token issued before a scope was added still works, but fails later on writes with 403
+        granted = auth_manager.cache_handler.get_cached_token() or {}
+        if 'scope' in granted:
+            missing = set(auth_manager.scope.split()) - set(granted['scope'].split())
+            if missing:
+                raise ValueError(f'Spotify token lacks scopes {", ".join(sorted(missing))}. '
+                                 f'Get a new one with --print-refresh-token')
 
         try:
             if arguments.json_path:
@@ -458,6 +514,8 @@ if __name__ == '__main__':
         finally:
             if arguments.report:
                 importer_instance.write_report(arguments.report)
+            if arguments.not_found:
+                importer_instance.write_not_found(arguments.not_found)
     except Exception as e:
         logger.error(f'An unexpected error occurred: {str(e)}')
         raise SystemExit(1)

@@ -11,6 +11,14 @@ on:
         description: 'Skip (space separated): likes playlists albums artists'
         required: false
         default: ''
+      json_path:
+        description: 'Import tracks from a JSON file in this repo instead of Yandex (e.g. edited not-found.json)'
+        required: false
+        default: ''
+      public:
+        description: Create public playlists (private by default)
+        type: boolean
+        default: false
 
 # two parallel runs would both create the same playlists
 concurrency:
@@ -45,9 +53,13 @@ jobs:
           YANDEX_TOKEN: ${{ secrets.YANDEX_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
           IGNORE: ${{ inputs.ignore }}
+          JSON_PATH: ${{ inputs.json_path }}
+          PUBLIC: ${{ inputs.public }}
         run: |
-          args=(--cache match-cache.json --report report.md)
+          args=(--cache match-cache.json --report report.md --not-found not-found.json)
           if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          if [ "$PUBLIC" = true ]; then args+=(--public); fi
+          if [ -n "$JSON_PATH" ]; then args+=(--json-path "$JSON_PATH"); fi
           # word splitting is intended here; argparse rejects anything but the allowed choices
           if [ -n "$IGNORE" ]; then args+=(--ignore $IGNORE); fi
           python importer.py "${args[@]}"
@@ -67,5 +79,7 @@ jobs:
         if: always()
         with:
           name: report
-          path: report.md
+          path: |
+            report.md
+            not-found.json
           if-no-files-found: ignore
