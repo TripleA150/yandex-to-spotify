@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import argparse
 import logging
@@ -508,6 +509,10 @@ if __name__ == '__main__':
         parser.error('The -c/--chunk argument must be between 1 and 40.')
     if not arguments.id or not arguments.secret:
         parser.error('Spotify --id and --secret are required.')
+    if not arguments.refresh_token and not arguments.print_refresh_token and not sys.stdin.isatty():
+        # without a terminal (GitHub Actions) spotipy's browser login dies with a bare EOFError
+        parser.error('SPOTIFY_REFRESH_TOKEN is not set and there is no terminal for a browser login. '
+                     'Get the token once with --print-refresh-token and save it as a secret.')
 
     try:
         auth_manager = make_auth_manager(arguments)
