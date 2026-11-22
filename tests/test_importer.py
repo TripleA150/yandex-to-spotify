@@ -196,12 +196,24 @@ class ImporterTest(unittest.TestCase):
             self.assertEqual((spotify.searches, spotify.created), (0, []))
 
     def test_refresh_token_auth_is_non_interactive(self):
-        args = Namespace(id='id', secret='secret', spotify=None, refresh_token='rt')
+        args = Namespace(id='id', secret='secret', spotify=None, refresh_token='rt', auth_url=None)
         auth = importer.make_auth_manager(args)
         with mock.patch.object(auth, 'refresh_access_token', return_value={'access_token': 'new', 'expires_at': 2**40}) as refresh, \
                 mock.patch.object(auth, 'get_auth_response', side_effect=AssertionError('prompted')):
             self.assertEqual(auth.get_access_token(as_dict=False), 'new')
         refresh.assert_called_once_with('rt')
+
+    def test_login_url_is_exchanged_for_a_token_without_prompt(self):
+        args = Namespace(id='id', secret='secret', spotify=None, refresh_token=None,
+                         auth_url='https://open.spotify.com/?code=abc')
+        response = mock.Mock(status_code=200, ok=True)
+        response.json.return_value = {'access_token': 'at', 'refresh_token': 'rt', 'expires_in': 3600,
+                                      'token_type': 'Bearer', 'scope': 'user-library-read'}
+        with mock.patch('requests.Session.post', return_value=response) as post, \
+                mock.patch('builtins.input', side_effect=AssertionError('prompted')):
+            auth = importer.make_auth_manager(args)
+        self.assertEqual(post.call_args.kwargs['data']['code'], 'abc')
+        self.assertEqual(auth.cache_handler.get_cached_token()['refresh_token'], 'rt')
 
 
 if __name__ == '__main__':

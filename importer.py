@@ -448,6 +448,8 @@ def make_auth_manager(arguments):
         cache_handler = MemoryCacheHandler(token_info={
             'access_token': '', 'refresh_token': arguments.refresh_token, 'expires_at': 0,
         })
+    elif arguments.auth_url:
+        cache_handler = MemoryCacheHandler()
 
     auth_manager = SpotifyOAuth(
         client_id=arguments.id,
@@ -456,11 +458,14 @@ def make_auth_manager(arguments):
         scope=SCOPE,
         username=arguments.spotify,
         cache_handler=cache_handler,
-        open_browser=not arguments.refresh_token,
+        open_browser=not (arguments.refresh_token or arguments.auth_url),
     )
-    if cache_handler:
+    if arguments.refresh_token:
         # spotipy discards cached tokens whose scope doesn't cover the requested one
         cache_handler.token_info['scope'] = auth_manager.scope
+    elif arguments.auth_url:
+        # one-time code from the page Spotify redirected to after the browser login
+        auth_manager.get_access_token(auth_manager.parse_response_code(arguments.auth_url), as_dict=False, check_cache=False)
     return auth_manager
 
 
@@ -475,6 +480,9 @@ if __name__ == '__main__':
                                help='Client Secret of your Spotify app (or SPOTIFY_CLIENT_SECRET env)')
     spotify_oauth.add_argument('--refresh-token', default=os.environ.get('SPOTIFY_REFRESH_TOKEN'),
                                help='Spotify refresh token for non-interactive runs (or SPOTIFY_REFRESH_TOKEN env)')
+    spotify_oauth.add_argument('--auth-url', default=os.environ.get('SPOTIFY_AUTH_URL'),
+                               help='Address Spotify redirected to after the login link, https://open.spotify.com/?code=... '
+                                    '(or SPOTIFY_AUTH_URL env). Works once, within a few minutes')
     spotify_oauth.add_argument('--print-refresh-token', action='store_true',
                                help='Authorize in the browser, print the refresh token and exit')
 
@@ -509,10 +517,10 @@ if __name__ == '__main__':
         parser.error('The -c/--chunk argument must be between 1 and 40.')
     if not arguments.id or not arguments.secret:
         parser.error('Spotify --id and --secret are required.')
-    if not arguments.refresh_token and not arguments.print_refresh_token and not sys.stdin.isatty():
+    if not (arguments.refresh_token or arguments.auth_url or arguments.print_refresh_token or sys.stdin.isatty()):
         # without a terminal (GitHub Actions) spotipy's browser login dies with a bare EOFError
-        parser.error('SPOTIFY_REFRESH_TOKEN is not set and there is no terminal for a browser login. '
-                     'Get the token once with --print-refresh-token and save it as a secret.')
+        parser.error('Spotify login is missing: open the login link from README and paste the address '
+                     'you land on into "Spotify login URL" when running the workflow.')
 
     try:
         auth_manager = make_auth_manager(arguments)

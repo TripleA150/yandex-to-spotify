@@ -15,7 +15,7 @@
 - **Пробный запуск** (`--dry-run`): только поиск и отчёт, в Spotify ничего не меняется.
 - **Отчёт** (`--report`): таблица «найдено / пропущено / добавлено / не найдено» и список ненайденного. В Actions он показывается на странице запуска.
 - **Кэш сопоставлений** (`--cache`): найденные соответствия сохраняются между запусками, поэтому повторный запуск не ищет заново тысячи треков и меньше упирается в лимиты API.
-- **Запуск без браузера** по refresh-токену Spotify, а значит, можно запускать в GitHub Actions.
+- **Вход в Spotify без терминала:** откройте ссылку в браузере и вставьте адрес, на который вас перебросит, в форму запуска workflow. Можно и сохранить refresh-токен в секрет, чтобы не входить каждый раз.
 - Учтены изменения Spotify Web API за 2026 год (новые эндпоинты плейлистов и библиотеки).
 
 ## Подготовка (один раз)
@@ -23,27 +23,26 @@
 1. Создайте приложение на [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) и добавьте `https://open.spotify.com` в Redirect URIs.
    С февраля 2026 года приложения в Development Mode работают только у владельцев Premium, и в разделе *User Management* должен быть указан ваш аккаунт.
 2. Получите OAuth-токен Яндекс Музыки ([как](https://github.com/MarshalX/yandex-music-api/discussions/513)).
-3. Получите refresh-токен Spotify. Это единственный шаг, где нужен браузер. Его можно выполнить локально или в GitHub Codespaces (*Code → Codespaces → Create*), тогда ничего не нужно ставить на свой компьютер:
-   ```bash
-   pip install -r requirements.txt
-   python importer.py --id <client_id> --secret <client_secret> --print-refresh-token
+3. Соберите ссылку для входа в Spotify: допишите свой Client ID в конец этой строки и сохраните результат в закладки.
    ```
-   Откройте показанную ссылку, разрешите доступ, скопируйте адрес, на который вас перенаправило (`https://open.spotify.com/?code=...`), и вставьте его в терминал. Скрипт выведет `SPOTIFY_REFRESH_TOKEN=...`.
-
-   Если вы получали токен до обновления скрипта, получите его заново: нужны права на приватные плейлисты. Если прав не хватает, скрипт об этом скажет.
+   https://accounts.spotify.com/authorize?response_type=code&redirect_uri=https%3A%2F%2Fopen.spotify.com&scope=playlist-modify-private+playlist-modify-public+playlist-read-private+ugc-image-upload+user-follow-modify+user-follow-read+user-library-modify+user-library-read&client_id=
+   ```
 
 ## Запуск в GitHub Actions
 
 1. *Settings → Secrets and variables → Actions → New repository secret*, добавьте:
-   `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REFRESH_TOKEN`, `YANDEX_TOKEN`.
-2. *Actions → Import Yandex.Music to Spotify → Run workflow*.
+   `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `YANDEX_TOKEN`.
+2. Откройте ссылку для входа из шага 3 подготовки и разрешите доступ (при следующих входах Spotify пропускает этот вопрос). Вас перебросит на страницу `https://open.spotify.com/?code=...` — скопируйте её адрес целиком.
+3. *Actions → Import Yandex.Music to Spotify → Run workflow*, вставьте адрес в поле *Spotify login URL* и запустите. Код в адресе одноразовый и действует несколько минут, поэтому для каждого запуска входите заново.
    По умолчанию включён **dry run**: сначала посмотрите отчёт, потом запустите с выключенной галочкой.
    В поле *Skip* можно перечислить, что не переносить: `likes playlists albums artists`.
-3. Отчёт появится на странице запуска (Summary), а в артефакте `report` будут `report.md` и `not-found.json`.
+4. Отчёт появится на странице запуска (Summary), а в артефакте `report` будут `report.md` и `not-found.json`.
 
 Чтобы догрузить ненайденное: скачайте `not-found.json`, поправьте в нём названия (или удалите лишнее), загрузите его в репозиторий (*Add file → Upload files*) и запустите workflow, указав в поле *Import tracks from a JSON file…* путь к файлу, например `not-found.json`. Треки добавятся в плейлист «Imported from JSON»; уже добавленные повторно не попадут.
 
 Запуск можно повторять сколько угодно: перенесётся только новое.
+
+Чтобы не входить перед каждым запуском, можно один раз получить refresh-токен и сохранить его в секрет `SPOTIFY_REFRESH_TOKEN`, тогда поле *Spotify login URL* можно оставлять пустым. Токен выдаёт команда `python importer.py --id <client_id> --secret <client_secret> --auth-url "<адрес после входа>" --print-refresh-token` (локально или в Codespaces).
 
 > Если репозиторий публичный, отчёт (названия плейлистов и ненайденные треки) видят все. Для переноса лучше сделать репозиторий приватным. Секреты в любом случае не видны.
 

@@ -3,6 +3,10 @@ name: Import Yandex.Music to Spotify
 on:
   workflow_dispatch:
     inputs:
+      spotify_login_url:
+        description: 'Spotify login URL: open the login link from README, paste the address you land on (https://open.spotify.com/?code=...)'
+        required: false
+        default: ''
       dry_run:
         description: Dry run — only search and show the report, change nothing in Spotify
         type: boolean
@@ -50,6 +54,7 @@ jobs:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
+          SPOTIFY_AUTH_URL: ${{ inputs.spotify_login_url }}
           YANDEX_TOKEN: ${{ secrets.YANDEX_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
           IGNORE: ${{ inputs.ignore }}
