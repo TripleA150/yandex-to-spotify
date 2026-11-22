@@ -1,0 +1,70 @@
+# yandex2spotify
+
+Перенос лайков, плейлистов, альбомов и артистов из Яндекс Музыки в Spotify.
+Форк [MarshalX/yandex2spotify](https://github.com/MarshalX/yandex2spotify), умеет запускаться прямо в GitHub Actions.
+
+Что добавлено по сравнению с оригиналом:
+
+- **Без дублей.** Повторный запуск ничего не задваивает:
+  - уже лайкнутые треки, сохранённые альбомы и артисты, на которых вы подписаны, пропускаются;
+  - если в Spotify уже есть ваш плейлист с таким же названием, он используется повторно, и в него добавляются только недостающие треки;
+  - если несколько треков Яндекса находятся как один и тот же трек Spotify, он добавляется один раз.
+- **Пробный запуск** (`--dry-run`): только поиск и отчёт, в Spotify ничего не меняется.
+- **Отчёт** (`--report`): таблица «найдено / пропущено / добавлено / не найдено» и список ненайденного. В Actions он показывается на странице запуска.
+- **Кэш сопоставлений** (`--cache`): найденные соответствия сохраняются между запусками, поэтому повторный запуск не ищет заново тысячи треков и меньше упирается в лимиты API.
+- **Запуск без браузера** по refresh-токену Spotify, а значит, можно запускать в GitHub Actions.
+- Учтены изменения Spotify Web API за 2026 год (новые эндпоинты плейлистов и библиотеки).
+
+## Подготовка (один раз)
+
+1. Создайте приложение на [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) и добавьте `https://open.spotify.com` в Redirect URIs.
+   С февраля 2026 года приложения в Development Mode работают только у владельцев Premium, и в разделе *User Management* должен быть указан ваш аккаунт.
+2. Получите OAuth-токен Яндекс Музыки ([как](https://github.com/MarshalX/yandex-music-api/discussions/513)).
+3. Получите refresh-токен Spotify. Это единственный шаг, где нужен браузер. Его можно выполнить локально или в GitHub Codespaces (*Code → Codespaces → Create*), тогда ничего не нужно ставить на свой компьютер:
+   ```bash
+   pip install -r requirements.txt
+   python importer.py --id <client_id> --secret <client_secret> --print-refresh-token
+   ```
+   Откройте показанную ссылку, разрешите доступ, скопируйте адрес, на который вас перенаправило (`https://open.spotify.com/?code=...`), и вставьте его в терминал. Скрипт выведет `SPOTIFY_REFRESH_TOKEN=...`.
+
+## Запуск в GitHub Actions
+
+1. *Settings → Secrets and variables → Actions → New repository secret*, добавьте:
+   `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REFRESH_TOKEN`, `YANDEX_TOKEN`.
+2. *Actions → Import Yandex.Music to Spotify → Run workflow*.
+   По умолчанию включён **dry run**: сначала посмотрите отчёт, потом запустите с выключенной галочкой.
+   В поле *Skip* можно перечислить, что не переносить: `likes playlists albums artists`.
+3. Отчёт появится на странице запуска (Summary) и в артефакте `report`.
+
+Запуск можно повторять сколько угодно: перенесётся только новое.
+
+> Если репозиторий публичный, отчёт (названия плейлистов и ненайденные треки) видят все. Для переноса лучше сделать репозиторий приватным. Секреты в любом случае не видны.
+
+## Локальный запуск
+
+```bash
+python importer.py --id <client_id> --secret <client_secret> -t <yandex_token> --dry-run --report report.md --cache match-cache.json
+```
+
+Параметры можно передать и через переменные окружения `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REFRESH_TOKEN` и `YANDEX_TOKEN`. Без refresh-токена откроется браузер для авторизации, как в оригинале.
+
+| Параметр | Что делает |
+|---|---|
+| `-i/--ignore likes playlists albums artists` | не переносить указанное |
+| `-n/--dry-run` | только поиск и отчёт |
+| `--report FILE` | записать отчёт в Markdown |
+| `--cache FILE` | хранить найденные соответствия между запусками |
+| `-j/--json-path FILE` | импорт треков из JSON в плейлист «Imported from JSON» |
+| `-c/--chunk N` | размер пачки запросов к Spotify (1–40) |
+| `-T/--timeout SEC` | таймаут запросов к Spotify |
+
+Формат JSON для `-j`:
+```json
+[{"artist": "Artist Name", "track": "Track Name"}]
+```
+
+## Тесты
+
+```bash
+python -m unittest discover tests
+```

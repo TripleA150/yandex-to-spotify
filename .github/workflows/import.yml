@@ -1,0 +1,71 @@
+name: Import Yandex.Music to Spotify
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Dry run — only search and show the report, change nothing in Spotify
+        type: boolean
+        default: true
+      ignore:
+        description: 'Skip (space separated): likes playlists albums artists'
+        required: false
+        default: ''
+
+# two parallel runs would both create the same playlists
+concurrency:
+  group: import
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore Yandex → Spotify match cache
+        uses: actions/cache/restore@v4
+        with:
+          path: match-cache.json
+          key: match-cache-${{ github.run_id }}
+          restore-keys: match-cache-
+
+      - name: Import
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
+          YANDEX_TOKEN: ${{ secrets.YANDEX_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          IGNORE: ${{ inputs.ignore }}
+        run: |
+          args=(--cache match-cache.json --report report.md)
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          # word splitting is intended here; argparse rejects anything but the allowed choices
+          if [ -n "$IGNORE" ]; then args+=(--ignore $IGNORE); fi
+          python importer.py "${args[@]}"
+
+      - name: Save match cache
+        if: always() && hashFiles('match-cache.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: match-cache.json
+          key: match-cache-${{ github.run_id }}
+
+      - name: Publish report
+        if: always() && hashFiles('report.md') != ''
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report
+          path: report.md
+          if-no-files-found: ignore
