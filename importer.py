@@ -60,8 +60,10 @@ def handle_spotify_exception(func):
 
                 wait = int((exception.headers or {}).get('retry-after', 4)) + 1
                 if wait > MAX_RETRY_AFTER_S:
-                    raise RuntimeError(f'Spotify rate limit: try again in {wait // 3600} h {wait % 3600 // 60} min. '
-                                       f'Found matches are cached, the next run continues from here.') from exception
+                    # QUOTA_EXCEEDED: the request quota Spotify gives development mode apps is used up
+                    raise RuntimeError(f'Spotify {exception.reason or "rate limit"}: try again in {wait // 3600} h '
+                                       f'{wait % 3600 // 60} min. Found matches are cached, '
+                                       f'the next run continues from here.') from exception
                 logger.info(f'Rate limited by Spotify, waiting {wait} s...')
                 sleep(wait)
             except ReadTimeout as exception:
@@ -91,18 +93,20 @@ def make_session():
 
 
 def best_match(item, found_items):
-    """Prefer results by the same artist, then with a close duration, then Spotify's own ranking."""
+    """Prefer the same recording (ISRC), then the same artist, then a close duration, then Spotify's ranking."""
     if isinstance(item, (str, Artist)):
         return found_items[0]
 
     names = {artist.name.casefold() for artist in item.artists}
     duration = getattr(item, 'duration_ms', None)
+    isrc = (getattr(item, 'isrc', None) or '').upper()
 
     def key(found):
+        same_isrc = bool(isrc) and (found.get('external_ids') or {}).get('isrc', '').upper() == isrc
         same_artist = any(artist['name'].casefold() in names for artist in found.get('artists', []))
         close = duration is not None and found.get('duration_ms') is not None \
             and abs(found['duration_ms'] - duration) <= DURATION_TOLERANCE_MS
-        return not same_artist, not close
+        return not same_isrc, not same_artist, not close
 
     return min(found_items, key=key)  # min() keeps the first of equal results
 
@@ -195,15 +199,13 @@ class Importer:
             return self.cache[cache_key]
 
         logger.info(f'Importing {type_}: {item_name}...')
-        found_items = []
+        # one search per item: Spotify gives development mode apps a small request quota
+        found_items = handle_spotify_exception(self.spotify_client.search)(query, type=type_)[f'{type_}s']['items']
 
-        # ISRC identifies the exact recording, so try it before the text search
+        # ISRC finds the recording when the names differ, e.g. "Кино" vs "Kino"
         isrc = getattr(item, 'isrc', None) if type_ == 'track' else None
-        if isrc:
+        if not found_items and isrc:
             found_items = handle_spotify_exception(self.spotify_client.search)(f'isrc:{isrc}', type='track')['tracks']['items']
-
-        if not found_items:
-            found_items = handle_spotify_exception(self.spotify_client.search)(query, type=type_)[f'{type_}s']['items']
 
         if not self._strict_search and not isinstance(item, Artist) and not len(found_items) and len(artists) > 1:
             query = f'{artists[0].name} {item.title}'

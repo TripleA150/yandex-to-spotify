@@ -122,10 +122,11 @@ class ImporterTest(unittest.TestCase):
             with open(report, encoding='UTF-8') as f:
                 self.assertIn('- X - missing', f.read())
 
-    def test_isrc_is_searched_first(self):
-        spotify = FakeSpotify({'isrc:RU1': 'exact', 'A a': 'fuzzy'})
-        make(spotify, FakeYandex(likes=[Track(1, 'A', 'a', isrc='RU1')])).import_all()
-        self.assertEqual(spotify.liked, {'exact'})
+    def test_one_search_per_track_and_isrc_only_when_text_finds_nothing(self):
+        spotify = FakeSpotify({'isrc:RU1': 'by-isrc', 'A a': 'by-text', 'isrc:RU2': 'kino'})
+        make(spotify, FakeYandex(likes=[Track(1, 'A', 'a', isrc='RU1'), Track(2, 'Кино', 'b', isrc='RU2')])).import_all()
+        self.assertEqual(spotify.liked, {'by-text', 'kino'})
+        self.assertEqual(spotify.searches, 3)
 
     def test_best_match_prefers_same_artist_then_close_duration(self):
         results = [
@@ -138,6 +139,9 @@ class ImporterTest(unittest.TestCase):
         self.assertEqual(importer.best_match(Track(1, 'Kino', 'x'), results)['id'], 'live')
         # nothing matches: keep Spotify's first result
         self.assertEqual(importer.best_match(Track(1, 'Nobody', 'x'), results)['id'], 'cover')
+        # the same ISRC beats everything else
+        results.append({'id': 'remaster', 'artists': [{'name': 'Kino'}], 'external_ids': {'isrc': 'ru1'}})
+        self.assertEqual(importer.best_match(Track(1, 'Kino', 'x', duration_ms=200000, isrc='RU1'), results)['id'], 'remaster')
 
     def test_not_found_file_can_be_imported_back(self):
         with tempfile.TemporaryDirectory() as tmp:
