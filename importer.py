@@ -6,8 +6,11 @@ from base64 import b64encode
 from time import sleep
 
 import spotipy
+import requests
 from PIL import Image
+from requests.adapters import HTTPAdapter
 from requests.exceptions import ReadTimeout
+from urllib3.util.retry import Retry
 from spotipy.cache_handler import MemoryCacheHandler
 from spotipy.exceptions import SpotifyException
 from spotipy.oauth2 import SpotifyOAuth
@@ -15,6 +18,8 @@ from yandex_music import Client, Artist
 
 REDIRECT_URI = 'https://open.spotify.com'
 MAX_REQUEST_RETRIES = 5
+# a longer rate limit ban stops the run: progress is cached, so it is cheaper to run again later
+MAX_RETRY_AFTER_S = 600
 # read scopes are needed for duplicate checks (library/contains, own playlists)
 SCOPE = ('playlist-modify-public,playlist-modify-private,playlist-read-private,user-library-modify,'
          'user-library-read,user-follow-modify,user-follow-read,ugc-image-upload')
@@ -52,8 +57,12 @@ def handle_spotify_exception(func):
                 if exception.http_status != 429:
                     raise exception
 
-                if 'retry-after' in exception.headers:
-                    sleep(int(exception.headers['retry-after']) + 1)
+                wait = int((exception.headers or {}).get('retry-after', 4)) + 1
+                if wait > MAX_RETRY_AFTER_S:
+                    raise RuntimeError(f'Spotify rate limit: try again in {wait // 3600} h {wait % 3600 // 60} min. '
+                                       f'Found matches are cached, the next run continues from here.') from exception
+                logger.info(f'Rate limited by Spotify, waiting {wait} s...')
+                sleep(wait)
             except ReadTimeout as exception:
                 logger.info(f'Read timed out. Retrying #{retry}...')
 
@@ -65,6 +74,19 @@ def handle_spotify_exception(func):
                 retry += 1
 
     return wrapper
+
+
+def make_session():
+    """Like spotipy's own session, but 429 is left to handle_spotify_exception.
+
+    spotipy's retry would sleep any Retry-After silently, even for hours.
+    """
+    session = requests.Session()
+    session.mount('https://', HTTPAdapter(max_retries=Retry(
+        total=3, read=False, backoff_factor=0.3, status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset(['GET', 'POST', 'PUT', 'DELETE']), respect_retry_after_header=False,
+    )))
+    return session
 
 
 def best_match(item, found_items):
@@ -210,11 +232,7 @@ class Importer:
         items.reverse()
         for item in items:
             try:
-                spotify_id = self._import_item(item)
-                if spotify_id is None:
-                    logger.warning('Item ID is None, skipping...')
-                    continue
-                spotify_items.append(spotify_id)
+                spotify_items.append(self._import_item(item))
                 logger.info('OK')
 
             except SpotifyException as exception:  # NotFoundException included
@@ -247,7 +265,7 @@ class Importer:
 
     def import_likes(self):
         likes_tracks = self.yandex_client.users_likes_tracks().tracks
-        tracks = self.yandex_client.tracks([f'{track.id}:{track.album_id}' for track in likes_tracks if track.album_id])
+        tracks = self.yandex_client.tracks([track.track_id for track in likes_tracks])
         logger.info('Importing liked tracks...')
 
         def save_tracks_callback(importer, spotify_tracks):
@@ -284,18 +302,25 @@ class Importer:
     def import_playlists(self):
         own_playlists = self._own_playlists()
         playlists = self.yandex_client.users_playlists_list()
+        used_titles = set()
         for playlist in playlists:
-            logger.info(f'Importing playlist {playlist.title}...')
+            # Yandex names every new playlist the same, so "Новый плейлист" x3 must not merge into one
+            title, number = playlist.title, 1
+            while title in used_titles:
+                number += 1
+                title = f'{playlist.title} ({number})'
+            used_titles.add(title)
+            logger.info(f'Importing playlist {title}...')
 
-            spotify_playlist_id = own_playlists.get(playlist.title)
+            spotify_playlist_id = own_playlists.get(title)
             if spotify_playlist_id:
                 logger.info('Playlist already exists in Spotify, adding only missing tracks')
                 existing_tracks = self._playlist_track_ids(spotify_playlist_id)
             else:
                 existing_tracks = set()
                 if not self.dry_run:
-                    spotify_playlist_id = handle_spotify_exception(self.spotify_client.current_user_playlist_create)(playlist.title, public=self.public)['id']
-                    own_playlists[playlist.title] = spotify_playlist_id
+                    spotify_playlist_id = handle_spotify_exception(self.spotify_client.current_user_playlist_create)(title, public=self.public)['id']
+                    own_playlists[title] = spotify_playlist_id
 
                     if playlist.cover.type == 'pic':
                         filename = f'{playlist.kind}-cover'
@@ -311,12 +336,12 @@ class Importer:
             else:
                 tracks = []
 
-            def save_tracks_callback(importer, spotify_tracks, playlist_id=spotify_playlist_id, title=playlist.title):
+            def save_tracks_callback(importer, spotify_tracks, playlist_id=spotify_playlist_id, title=title):
                 logger.info(f'Saving {len(spotify_tracks)} tracks in playlist {title}...')
                 handle_spotify_exception(importer.spotify_client.playlist_add_items)(playlist_id, spotify_tracks)
                 logger.info('OK')
 
-            self._add_items_to_spotify(tracks, playlist.title, save_tracks_callback,
+            self._add_items_to_spotify(tracks, title, save_tracks_callback,
                                        lambda ids, existing=existing_tracks: existing.intersection(ids))
 
     def import_albums(self):
@@ -369,7 +394,7 @@ class Importer:
         lines += ['| Section | In Yandex | Found | Skipped (already there / duplicate) | Added | Not found |',
                   '|---|---|---|---|---|---|']
         for section, s in self.stats.items():
-            lines.append(f"| {section} | {s['total']} | {s['found']} | {s['duplicates']} | {s['added']} | {s['not_found']} |")
+            lines.append(f"| {section.replace('|', '&#124;')} | {s['total']} | {s['found']} | {s['duplicates']} | {s['added']} | {s['not_found']} |")
         for section, items in self.not_imported.items():
             if items:
                 lines += ['', f'<details><summary>Not found in {section} ({len(items)})</summary>', '']
@@ -387,6 +412,13 @@ class Importer:
     def import_from_json(self, file_path):
         with open(file_path, 'r', encoding='UTF-8') as file:
             tracks = json.load(file)
+
+        # the file is meant to be edited by hand, so point at the broken entry instead of crashing mid-run
+        if not isinstance(tracks, list):
+            raise ValueError(f'{file_path}: expected a list of {{"artist": "...", "track": "..."}}')
+        for number, track in enumerate(tracks, 1):
+            if not (isinstance(track, dict) and isinstance(track.get('artist'), str) and isinstance(track.get('track'), str)):
+                raise ValueError(f'{file_path}: entry #{number} must look like {{"artist": "...", "track": "..."}}, got {track!r}')
 
         playlist_name = 'Imported from JSON'
         playlist_id = self._own_playlists().get(playlist_name)
@@ -453,7 +485,7 @@ if __name__ == '__main__':
 
     parser.add_argument('-T', '--timeout', help='Request timeout for spotify', type=float, default=10)
 
-    parser.add_argument('-S', '--strict-artists-search', help='Search for an exact match of all artists', default=False)
+    parser.add_argument('-S', '--strict-artists-search', help='Search for an exact match of all artists', action='store_true')
 
     parser.add_argument('-j', '--json-path', help='JSON file to import tracks from')
 
@@ -479,7 +511,8 @@ if __name__ == '__main__':
 
     try:
         auth_manager = make_auth_manager(arguments)
-        spotify_client_ = spotipy.Spotify(auth_manager=auth_manager, requests_timeout=arguments.timeout)
+        spotify_client_ = spotipy.Spotify(auth_manager=auth_manager, requests_timeout=arguments.timeout,
+                                          requests_session=make_session())
 
         if arguments.print_refresh_token:
             spotify_client_.me()
@@ -516,6 +549,6 @@ if __name__ == '__main__':
                 importer_instance.write_report(arguments.report)
             if arguments.not_found:
                 importer_instance.write_not_found(arguments.not_found)
-    except Exception as e:
-        logger.error(f'An unexpected error occurred: {str(e)}')
+    except Exception:
+        logger.exception('An unexpected error occurred')
         raise SystemExit(1)

@@ -62,10 +62,13 @@ class FakeYandex:
         self._playlists = playlists
 
     def users_likes_tracks(self):
-        return SimpleNamespace(tracks=[SimpleNamespace(id=t.id, album_id=1) for t in self.likes])
+        # the last like has no album, like a track uploaded by the user
+        return SimpleNamespace(tracks=[SimpleNamespace(track_id=f'{t.id}:1' if i < len(self.likes) - 1 else str(t.id))
+                                       for i, t in enumerate(self.likes)])
 
     def tracks(self, ids):
-        return list(self.likes)
+        by_id = {str(t.id): t for t in self.likes}
+        return [by_id[i.split(':')[0]] for i in ids]
 
     def users_playlists_list(self):
         return [SimpleNamespace(title=title, kind=1, collective=False, cover=SimpleNamespace(type='mosaic'),
@@ -151,6 +154,46 @@ class ImporterTest(unittest.TestCase):
             make(spotify, None, ignore=()).import_from_json(not_found)
             self.assertEqual(spotify.playlists, {'Imported from JSON': ['sx']})
             self.assertEqual(spotify.created, [('Imported from JSON', False)])
+
+    def test_playlists_with_the_same_title_stay_apart(self):
+        spotify = FakeSpotify(CATALOG, playlists={'New (2)': ['sb']})
+        imp = make(spotify, FakeYandex(playlists=[('New', [A]), ('New', [B]), ('New', [C])]),
+                   ignore=('likes', 'albums', 'artists'))
+        imp.import_all()
+        self.assertEqual(spotify.playlists, {'New': ['sa'], 'New (2)': ['sb'], 'New (3)': ['sc']})
+        self.assertEqual([s['added'] for s in imp.stats.values()], [1, 0, 1])
+
+    def test_rate_limit_waits_short_and_stops_on_long_bans(self):
+        def limited(retry_after):
+            calls = []
+
+            def call():
+                calls.append(1)
+                if len(calls) == 1:
+                    raise importer.SpotifyException(429, -1, 'limited', headers={'retry-after': retry_after})
+                return 'ok'
+            return call
+
+        with mock.patch.object(importer, 'sleep') as sleep:
+            self.assertEqual(importer.handle_spotify_exception(limited('2'))(), 'ok')
+            sleep.assert_called_once_with(3)
+            with self.assertRaisesRegex(RuntimeError, 'try again in 27 h'):
+                importer.handle_spotify_exception(limited('99999'))()
+
+        # 429 must reach handle_spotify_exception instead of being slept through inside urllib3
+        retry = importer.make_session().get_adapter('https://api.spotify.com').max_retries
+        self.assertFalse(retry.is_retry('GET', 429, has_retry_after=True))
+        self.assertTrue(retry.is_retry('GET', 503, has_retry_after=True))
+
+    def test_broken_json_entry_is_reported_before_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'tracks.json')
+            with open(path, 'w', encoding='UTF-8') as f:
+                json.dump([{'artist': 'A', 'track': 'a'}, {'artst': 'B', 'track': 'b'}], f)
+            spotify = FakeSpotify(CATALOG)
+            with self.assertRaisesRegex(ValueError, 'entry #2'):
+                make(spotify, None, ignore=()).import_from_json(path)
+            self.assertEqual((spotify.searches, spotify.created), (0, []))
 
     def test_refresh_token_auth_is_non_interactive(self):
         args = Namespace(id='id', secret='secret', spotify=None, refresh_token='rt')
