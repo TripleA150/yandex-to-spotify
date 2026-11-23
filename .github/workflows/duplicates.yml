@@ -7,6 +7,10 @@ on:
         description: 'Spotify login URL: open the login link from README, paste the address you land on (https://open.spotify.com/?code=...)'
         required: false
         default: ''
+      remove:
+        description: Remove duplicates, keep the copy added first
+        type: boolean
+        default: false
 
 jobs:
   duplicates:
@@ -28,7 +32,11 @@ jobs:
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
           SPOTIFY_AUTH_URL: ${{ inputs.spotify_login_url }}
-        run: python duplicates.py --report duplicates.md
+          REMOVE: ${{ inputs.remove }}
+        run: |
+          args=(--report duplicates.md)
+          if [ "$REMOVE" = true ]; then args+=(--remove); fi
+          python duplicates.py "${args[@]}"
 
       - name: Publish report
         if: always() && hashFiles('duplicates.md') != ''
