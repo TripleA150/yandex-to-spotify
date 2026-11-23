@@ -92,6 +92,18 @@ def make_session():
     return session
 
 
+def iter_pages(spotify_client, page):
+    """Items of a paged Spotify response, following its 'next' links."""
+    while page:
+        yield from page['items']
+        page = handle_spotify_exception(spotify_client.next)(page) if page['next'] else None
+
+
+def entry_track(entry):
+    """Track of a playlist or library entry: Spotify renamed 'track' to 'item' in 2026, accept both."""
+    return entry.get('item') or entry.get('track')
+
+
 def best_match(item, found_items):
     """Prefer the same recording (ISRC), then the same artist, then a close duration, then Spotify's ranking."""
     if isinstance(item, (str, Artist)):
@@ -282,25 +294,15 @@ class Importer:
     def _own_playlists(self):
         """Map name -> id of playlists owned by the current user."""
         playlists = {}
-        page = handle_spotify_exception(self.spotify_client.current_user_playlists)()
-        while page:
-            for playlist in page['items']:
-                if playlist and playlist['owner']['id'] == self.user:
-                    playlists.setdefault(playlist['name'], playlist['id'])
-            page = handle_spotify_exception(self.spotify_client.next)(page) if page['next'] else None
+        for playlist in iter_pages(self.spotify_client, handle_spotify_exception(self.spotify_client.current_user_playlists)()):
+            if playlist and playlist['owner']['id'] == self.user:
+                playlists.setdefault(playlist['name'], playlist['id'])
         return playlists
 
     def _playlist_track_ids(self, playlist_id):
-        ids = set()
-        page = handle_spotify_exception(self.spotify_client.playlist_items)(playlist_id, additional_types=('track',))
-        while page:
-            for entry in page['items']:
-                # Spotify renamed 'track' to 'item' in 2026, accept both
-                track = entry.get('item') or entry.get('track')
-                if track and track.get('id'):
-                    ids.add(track['id'])
-            page = handle_spotify_exception(self.spotify_client.next)(page) if page['next'] else None
-        return ids
+        first_page = handle_spotify_exception(self.spotify_client.playlist_items)(playlist_id, additional_types=('track',))
+        tracks = map(entry_track, iter_pages(self.spotify_client, first_page))
+        return {track['id'] for track in tracks if track and track.get('id')}
 
     def import_playlists(self):
         own_playlists = self._own_playlists()

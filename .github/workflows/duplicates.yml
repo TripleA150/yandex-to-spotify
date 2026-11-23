@@ -1,0 +1,35 @@
+name: Find duplicate tracks in Spotify
+
+on:
+  workflow_dispatch:
+    inputs:
+      spotify_login_url:
+        description: 'Spotify login URL: open the login link from README, paste the address you land on (https://open.spotify.com/?code=...)'
+        required: false
+        default: ''
+
+jobs:
+  duplicates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Find duplicates
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
+          SPOTIFY_AUTH_URL: ${{ inputs.spotify_login_url }}
+        run: python duplicates.py --report duplicates.md
+
+      - name: Publish report
+        if: always() && hashFiles('duplicates.md') != ''
+        run: cat duplicates.md >> "$GITHUB_STEP_SUMMARY"
